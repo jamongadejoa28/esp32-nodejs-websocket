@@ -8,10 +8,6 @@
 // ── API server ────────────────────────────────────────────────
 // FastAPI (server/app.py) 실행 PC의 IP로 변경할 것.
 // 실행: uvicorn app:app --host 0.0.0.0 --port 8000
-// #define API_URL     "http://192.168.0.102:8000/"
-// #define API_URL "http://localhost:3000"
-#define WS_HOST "192.168.0.126"
-#define WS_PORT 3400
 
 // ── Sensor I2C ────────────────────────────────────────────────
 // GPIO8 = SDA, GPIO9 = SCL

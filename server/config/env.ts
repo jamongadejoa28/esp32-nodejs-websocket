@@ -11,6 +11,7 @@ const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 export const WS_PORT = Number(process.env.WS_PORT ?? 8080);
+export const WS_HOST = String(process.env.WS_HOST ?? '0.0.0.0');
 
 
 /* --- 유효성 검사 --- */

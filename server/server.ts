@@ -1,6 +1,6 @@
 import { createServer, Socket } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
-import { pool, WS_PORT } from './config/env.js';
+import { pool, WS_PORT, WS_HOST } from './config/env.js';
 
 console.log('[env] DB_HOST:', process.env.DB_HOST);
 console.log('[env] DB_PORT:', process.env.DB_PORT);
@@ -8,8 +8,9 @@ console.log('[env] DB_USER:', process.env.DB_USER);
 console.log('[env] DB_NAME:', process.env.DB_NAME);
 console.log('[env] DB_PASS:', process.env.DB_PASS ? '***' : 'MISSING');
 console.log('[env] WS_PORT:', process.env.WS_PORT);
+console.log('[env] WS_HOST:', process.env.WS_HOST);
 
-const HOST = '0.0.0.0';
+const HOST = WS_HOST;
 const PORT = WS_PORT;
 const clients = new Set<Client>();
 const RFC6455_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
