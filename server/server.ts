@@ -2,6 +2,13 @@ import { createServer, Socket } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { pool, WS_PORT } from './config/env.js';
 
+console.log('[env] DB_HOST:', process.env.DB_HOST);
+console.log('[env] DB_PORT:', process.env.DB_PORT);
+console.log('[env] DB_USER:', process.env.DB_USER);
+console.log('[env] DB_NAME:', process.env.DB_NAME);
+console.log('[env] DB_PASS:', process.env.DB_PASS ? '***' : 'MISSING');
+console.log('[env] WS_PORT:', process.env.WS_PORT);
+
 const HOST = '0.0.0.0';
 const PORT = WS_PORT;
 const clients = new Set<Client>();
@@ -143,9 +150,9 @@ class Client {
     /* DB Query Function */
     // scheima에서 데이터 타입이 정수인 숫자로만 이루어져 있다.
     private async insertSensor(values: number[]) {
-        const conn = await pool.getConnection();
+        // const conn = await pool.getConnection();
         try {
-            // await using conn = await pool.getConnection();
+            await using conn = await pool.getConnection();
             const sql = `
         INSERT INTO pm_sensor_data
             (recorded_at,
@@ -159,8 +166,6 @@ class Client {
             console.log(`[db] inserted - pm2.5=${values[1]} ug/m³`);
         } catch (e: any) {
             console.warn(`[db] insert failed: ${e.code ?? e.message}`);
-        } finally {
-            conn.release();
         }
     }
 
