@@ -5,4 +5,4 @@
 .vscode/ipch
 .env
 .sql
-/include*
+/include/config_local.h
