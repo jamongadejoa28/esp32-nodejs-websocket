@@ -2,12 +2,16 @@ import { createServer, Socket } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
 import { pool, env } from './config/env.js';
 
-const HOST = '0.0.0.0';
+const HOST = '0.0.0.0';        // WSL2 mirrored 모드에서는 반드시 0.0.0.0에 bind
 const PORT = env.WS_PORT;
 const clients = new Set<Client>();
 const RFC6455_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
-/* ── RFC 6455 opcode (수신 시 b0 & 0x0F, 송신 시 0x80 | code) ───────── */
+
+/* ── RFC 6455 opcode ────────────────────────────────────────────────
+ * 수신 시 opcode = b0 & 0x0F
+ * 송신 시 첫 바이트 = 0x80 | opcode  (FIN=1, RSV=000, opcode 4비트)
+ * ──────────────────────────────────────────────────────────────── */
 const Opcode = {
     Text:   0x01,
     Binary: 0x02,
@@ -17,22 +21,31 @@ const Opcode = {
 } as const;
 type Opcode = typeof Opcode[keyof typeof Opcode];
 
-/* ── 도메인 모델: 센서 한 프레임 (모두 uint16) ───────────────────── */
+
+/* ── 도메인 모델: 센서 한 프레임 (모두 uint16, 0~65535) ───────────────
+ * INSERT 컬럼 순서와 동일하게 유지해야 함.
+ * SensorValues는 12-튜플로 길이를 컴파일러가 보장.
+ * ──────────────────────────────────────────────────────────────── */
 const SENSOR_FIELDS = [
     'pm1_grimm', 'pm25_grimm', 'pm10_grimm',
     'pm1_tsi',   'pm25_tsi',   'pm10_tsi',
     'cnt_0p3',   'cnt_0p5',    'cnt_1p0',
     'cnt_2p5',   'cnt_5p0',    'cnt_10',
-] as const;
+] as const;    // 읽기 전용 프레임 데이터
 
 type SensorField = typeof SENSOR_FIELDS[number];
 type SensorPayload = Record<SensorField, number>;
-/* INSERT 컬럼 순서와 동일한 12-튜플 (컴파일러가 길이 보장) */
 type SensorValues = [
     number, number, number, number, number, number,
     number, number, number, number, number, number
 ];
 
+/* ── 외부 JSON 입력 → SensorPayload 타입 가드 ─────────────────────────
+ * 데이터 프레임 유효성 검사
+ *   - 정수여야 함 (소수점 이하 버림)
+ *   - 0 이상 65535 이하 (16비트 부호 없는 정수 범위)
+ * 통과하면 SensorPayload, 실패하면 null.
+ * ──────────────────────────────────────────────────────────────── */
 function parseSensorPayload(raw: unknown): SensorPayload | null {
     if (typeof raw !== 'object' || raw === null) return null;
     const obj = raw as Record<string, unknown>;
@@ -48,6 +61,7 @@ function parseSensorPayload(raw: unknown): SensorPayload | null {
     return out;
 }
 
+// SensorPayload → SQL 바인딩용 12-튜플 (컬럼 순서대로)
 function toSensorValues(p: SensorPayload): SensorValues {
     return SENSOR_FIELDS.map((f) => p[f]) as SensorValues;
 }
@@ -61,6 +75,7 @@ class Client {
 
     constructor(socket: Socket) {
         this.socket = socket;
+        // 'data' 이벤트의 chunk는 Buffer로 들어옴 (Node 타입 정의상 보장)
         socket.on('data', (chunk: Buffer) => this.onData(chunk));
         socket.on('error', () => this.close());
         socket.on('end', () => this.close());
@@ -107,7 +122,7 @@ class Client {
             if (this.buf.length < 2) return;
             const b0 = this.buf[0];
             const b1 = this.buf[1];
-            const op = (b0 & 0x0F) as Opcode;
+            const op = (b0 & 0x0F) as Opcode;     // 하위 4비트만 opcode
             const masked = (b1 & 0x80) !== 0;
             let plen = b1 & 0x7F;
             let off = 2;
@@ -135,6 +150,7 @@ class Client {
             }
             this.buf = this.buf.subarray(off + plen);
 
+            /* 프레임 처리 — opcode별 분기 */
             switch (op) {
                 case Opcode.Text:
                     this.handleTextPayload(payload.toString('utf8'));
@@ -143,7 +159,7 @@ class Client {
                     this.close();
                     break;
                 case Opcode.Ping:
-                    this.sendFrame(0x80 | Opcode.Pong, payload);
+                    this.sendFrame(0x80 | Opcode.Pong, payload);   // ping → pong
                     break;
             }
         }
@@ -158,16 +174,20 @@ class Client {
             return;
         }
 
+        // 타입 가드 통과 시 SensorPayload 보장
         const payload = parseSensorPayload(parsed);
         if (payload === null) return;
 
+        // typescript의 DB insert 기능 — await 안 함 (TCP 수신 블로킹 방지)
         this.insertSensor(toSensorValues(payload)).catch(console.error);
     }
 
 
-    /* DB Query Function — 스키마 12 컬럼 (모두 uint16) */
+    /* DB Query Function */
+    // schema에서 데이터 타입이 모두 정수(uint16)이므로 12-튜플 number로 바인딩
     private async insertSensor(values: SensorValues) {
         try {
+            // await using: 스코프 종료 시 자동으로 conn.release() 호출 (TC39 explicit resource management)
             await using conn = await pool.getConnection();
             const sql = `
         INSERT INTO pm_sensor_data
@@ -181,6 +201,7 @@ class Client {
             await conn.execute(sql, values);
             console.log(`[db] inserted - pm2.5=${values[1]} ug/m³`);
         } catch (e: unknown) {
+            // catch는 unknown으로 받고 알려진 형태(ErrnoException)로 좁혀서 사용
             const err = e as NodeJS.ErrnoException;
             console.warn(`[db] insert failed: ${err.code ?? err.message ?? String(e)}`);
         }
