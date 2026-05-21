@@ -1,3 +1,5 @@
+#include "config_local.h"
+
 #pragma once
 
 // WiFi credentials are stored in NVS (non-volatile flash).

@@ -10,7 +10,7 @@ console.log('[env] DB_PASS:', process.env.DB_PASS ? '***' : 'MISSING');
 console.log('[env] WS_PORT:', process.env.WS_PORT);
 console.log('[env] WS_HOST:', process.env.WS_HOST);
 
-const HOST = WS_HOST;
+const HOST = "0.0.0.0";
 const PORT = WS_PORT;
 const clients = new Set<Client>();
 const RFC6455_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';

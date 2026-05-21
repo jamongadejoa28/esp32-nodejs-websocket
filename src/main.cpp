@@ -10,6 +10,8 @@
 static WebSocketsClient ws;
 static bool wsconnectd = false;
 
+
+
 // ── Logging ───────────────────────────────────────────────────────────────────
 // Format: [  12345][TAG] message
 #define LOG(tag, fmt, ...) Serial.printf("[%7lu][" tag "] " fmt "\n", millis(), ##__VA_ARGS__)
@@ -21,6 +23,7 @@ static bool wsconnectd = false;
 // "Setup continuous measurement" command [P1..P7]
 // P7 = 0x16^0x07^0x03^0xFF^0xFF^0x00 = 0x12
 static const uint8_t CMD_START_CONT[] = {0x16, 0x07, 0x03, 0xFF, 0xFF, 0x00, 0x12};
+
 
 #define STATUS_CLOSE    0x01
 #define STATUS_TESTING  0x02
