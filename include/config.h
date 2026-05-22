@@ -19,7 +19,7 @@
 #define SENSOR_ADDR 0x28
 
 // ── Timing ────────────────────────────────────────────────────
-#define READ_INTERVAL_MS  10000UL
+#define READ_INTERVAL_MS  10000UL       // unsinged long
 #define WIFI_TIMEOUT_MS   20000UL
 
 // ── NVS namespace for WiFi credential storage ─────────────────

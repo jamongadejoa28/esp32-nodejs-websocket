@@ -39,6 +39,10 @@ struct SensorData {
 };
 
 // ── WiFi / NVS ────────────────────────────────────────────────────────────────
+/*
+    NVS: esp32 내부의 비휘발성 메모리인 wifi 정보를 담는 영역에 wifi 정보를 저장
+    한번 저장해두면 다음에 자동으로 연결됨.
+*/
 static Preferences prefs;
 
 static bool loadCreds(String &ssid, String &pass) {
@@ -76,10 +80,13 @@ static bool tryConnect(const String &ssid, const String &pass) {
 }
 
 static void scanNetworks() {
+    /* LOG사용시 다음줄에 반드시 flush로 버퍼 비우기 */
     LOG("WIFI", "Scanning for networks...");
+    Serial.flush();                          // scan은 수 초 블록 → 미리 비워둠
     int n = WiFi.scanNetworks();
     if (n <= 0) {
         LOG("WIFI", "No networks found");
+        Serial.flush();
         return;
     }
     Serial.printf("[  WIFI] Found %d network(s):\n", n);
@@ -87,29 +94,68 @@ static void scanNetworks() {
         Serial.printf("         %2d. %-32s  %4d dBm  %s\n",
             i + 1,
             WiFi.SSID(i).c_str(),
-            WiFi.RSSI(i),
+            WiFi.RSSI(i),           // 수신 신호 강도 표시: -100 ~ 0 범위로 0에 가까울수록 신호세기가 강함
             WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "Open" : "Encrypted");
+        Serial.flush();                      // USB-CDC TX 버퍼가 짧아 다중 라인 시 유실 가능
     }
     WiFi.scanDelete();
 }
 
-// Waits for serial input and returns trimmed string.
-// Timeout: 120 seconds. Password not echoed for security.
+// 한 글자씩 읽어 즉시 echo (password는 '*'로 마스킹).
+// BS(0x08)/DEL(0x7F)로 마지막 글자 삭제, CR/LF로 입력 종료.
+// 라인 단위 입력만 받는 readStringUntil()과 달리 타이핑이 화면에 보이고
+// 백스페이스가 동작한다. Timeout: 120초.
 static String readSerial(const char *prompt, bool echo = true) {
     Serial.print(prompt);
     Serial.flush();
-    Serial.setTimeout(120000);
-    String s = Serial.readStringUntil('\n');
-    s.trim();
-    if (echo) {
-        Serial.println(s);
-    } else {
-        Serial.println("********");
+
+    String s;
+    const unsigned long deadline = millis() + 120000UL;
+    while ((long)(deadline - millis()) > 0) {
+        if (!Serial.available()) {
+            delay(2);
+            continue;
+        }
+        int c = Serial.read();
+        if (c < 0) continue;
+
+        // 엔터: CR/LF 어느 쪽이든 종료. CRLF 페어면 짝꿍 한 글자만 더 소비.
+        if (c == '\r' || c == '\n') {
+            unsigned long t = millis();
+            while (!Serial.available() && millis() - t < 5) {}
+            if (Serial.available()) {
+                int p = Serial.peek();
+                if ((c == '\r' && p == '\n') || (c == '\n' && p == '\r')) Serial.read();
+            }
+            Serial.println();
+            Serial.flush();
+            return s;
+        }
+
+        // 백스페이스/DEL: 버퍼에서 한 글자 빼고 화면에서도 한 칸 지움
+        if (c == 0x08 || c == 0x7F) {
+            if (s.length() > 0) {
+                s.remove(s.length() - 1);
+                Serial.print("\b \b");
+                Serial.flush();
+            }
+            continue;
+        }
+
+        // 인쇄 가능한 ASCII만 받음 (제어문자/ANSI escape 등은 무시)
+        if (c >= 0x20 && c < 0x7F) {
+            s += (char)c;
+            Serial.write(echo ? (char)c : '*');
+            Serial.flush();
+        }
     }
-    Serial.setTimeout(1000);
+    Serial.println();
+    Serial.flush();
     return s;
 }
 
+// WebSocket 연결의 전제 조건이므로 WL_CONNECTED 될 때까지 반복.
+// 매 시도마다 네트워크를 다시 스캔해서 사용자가 가까운 AP를 새로 확인할 수 있게 한다.
 static void provisionWiFi() {
     Serial.println();
     Serial.println("============================================================");
@@ -117,17 +163,26 @@ static void provisionWiFi() {
     Serial.println("  - Make sure [No line ending] or [Newline] is selected");
     Serial.println("    in the serial monitor line-ending option.");
     Serial.println("============================================================");
-    scanNetworks();
 
-    String ssid = readSerial("\n>>> SSID     : ");
-    String pass = readSerial(">>> Password : ", false);
+    while (WiFi.status() != WL_CONNECTED) {
+        scanNetworks();
 
-    LOG("WIFI", "Attempting connection with entered credentials...");
-    if (tryConnect(ssid, pass)) {
-        saveCreds(ssid, pass);
-        Serial.println("============================================================");
-    } else {
-        LOG("WIFI", "Provisioning failed — will retry stored creds on next boot");
+        String ssid = readSerial("\n>>> SSID     : ");
+        if (ssid.length() == 0) {
+            LOG("WIFI", "Empty SSID — please try again");
+            continue;
+        }
+        String pass = readSerial(">>> Password : ", false);
+
+        LOG("WIFI", "Attempting connection with entered credentials...");
+        if (tryConnect(ssid, pass)) {
+            saveCreds(ssid, pass);
+            Serial.println("============================================================");
+            return;
+        }
+        LOG("WIFI", "Connection failed — re-enter SSID/password");
+        WiFi.disconnect(true);
+        delay(200);
     }
 }
 
