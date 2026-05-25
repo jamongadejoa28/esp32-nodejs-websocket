@@ -36,6 +36,11 @@ struct SensorData {
     uint16_t pm1_tsi,   pm25_tsi,   pm10_tsi;
     uint16_t cnt_0p3, cnt_0p5, cnt_1p0;
     uint16_t cnt_2p5, cnt_5p0, cnt_10;
+
+    // US633-F1K-T4 차압. pressure_ok=false면 JSON에 null로 직렬화.
+    int32_t  pressure_pa;
+    uint8_t  pressure_status;
+    bool     pressure_ok;
 };
 
 // ── WiFi / NVS ────────────────────────────────────────────────────────────────
@@ -256,6 +261,44 @@ static bool readSensor(SensorData &d) {
     return true;
 }
 
+// ── US633-F1K-T4 차압센서 ────────────────────────────────────────────────────
+// Force Mode 1바이트 트리거 → >10ms 대기 → 4바이트 읽기 [status,p_hi,p_mid,p_lo]
+// 변환식 (datasheet 9페이지):
+//   Pa = (raw24 - 0x800000) * 0x07D0 / 0xB33333
+//        = (raw24 - 8388608) * 2000 / 11744051
+// 곱셈 중간값이 1.6e10 수준이므로 반드시 int64로 계산.
+static bool readPressure(SensorData &d) {
+    d.pressure_ok = false;
+
+    Wire.beginTransmission(PRESSURE_ADDR);
+    Wire.write(PRESSURE_CMD_FORCE);
+    if (Wire.endTransmission() != 0) {
+        LOG("PRES", "Force-mode write failed (no ACK?)");
+        return false;
+    }
+
+    delay(PRESSURE_WAIT_MS);
+
+    uint8_t got = Wire.requestFrom((uint8_t)PRESSURE_ADDR, (uint8_t)PRESSURE_FRAME_SIZE);
+    if (got < PRESSURE_FRAME_SIZE) {
+        LOG("PRES", "Short read: %u/%u", got, PRESSURE_FRAME_SIZE);
+        return false;
+    }
+    uint8_t st  = Wire.read();
+    uint8_t hi  = Wire.read();
+    uint8_t mid = Wire.read();
+    uint8_t lo  = Wire.read();
+
+    uint32_t raw24 = ((uint32_t)hi << 16) | ((uint32_t)mid << 8) | lo;
+    int64_t  centered = (int64_t)raw24 - (int64_t)0x800000;
+    int64_t  pa64     = (centered * 2000LL) / 11744051LL;
+
+    d.pressure_status = st;
+    d.pressure_pa     = (int32_t)pa64;
+    d.pressure_ok     = true;
+    return true;
+}
+
 // ── HTTP POST ─────────────────────────────────────────────────────────────────
 static bool postData(const SensorData &d) {
     // ensureWiFi();
@@ -282,6 +325,15 @@ static bool postData(const SensorData &d) {
     doc["cnt_2p5"]    = d.cnt_2p5;
     doc["cnt_5p0"]    = d.cnt_5p0;
     doc["cnt_10"]     = d.cnt_10;
+
+    // pressure_ok=false면 null로 직렬화 (서버 측에서 NULL 컬럼으로 INSERT)
+    if (d.pressure_ok) {
+        doc["pressure_pa"]     = d.pressure_pa;
+        doc["pressure_status"] = d.pressure_status;
+    } else {
+        doc["pressure_pa"]     = nullptr;
+        doc["pressure_status"] = nullptr;
+    }
 
     String body;
     serializeJson(doc, body);
@@ -348,7 +400,8 @@ void setup() {
     }
 
     connectWiFi();
-    ws.begin(WS_HOST, WS_PORT, "/");
+    // 서버는 /ingest 경로로 ESP32 ingress를 받고, /live 경로는 대시보드 구독자용.
+    ws.begin(WS_HOST, WS_PORT, "/ingest");
     ws.onEvent(wsEvent);
     ws.setReconnectInterval(5000);
 
@@ -365,6 +418,12 @@ void loop() {
 
     SensorData data;
     if (!readSensor(data)) return;
+
+    // 차압센서는 PM 센서와 같은 tick에 읽되, 실패해도 PM 데이터는 전송한다.
+    readPressure(data);
+    if (data.pressure_ok) {
+        LOG("PRES", "raw_status=0x%02X pa=%ld", data.pressure_status, (long)data.pressure_pa);
+    }
 
     const char *statusStr =
         data.status == STATUS_STABLE  ? "STABLE"  :
