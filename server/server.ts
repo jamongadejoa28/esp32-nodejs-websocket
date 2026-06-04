@@ -1,108 +1,117 @@
-import { createServer, Socket } from 'node:net';
-import { createHash, randomUUID } from 'node:crypto';
-import { pool, env } from './config/env.js';
+/* ── 단일 TCP 리스너에서 HTTP/1.1 REST + WebSocket(/ingest, /live) 다중화 ─
+ *
+ * 외부 프레임워크(express, ws) 사용 안 함. 임베디드 스타일로 데이터
+ * 프로토콜을 엄격히 직접 관리한다.
+ *
+ *   1. socket 'data' 이벤트 → Buffer 누적
+ *   2. WebSocket 업그레이드되지 않은 상태면 HTTP 헤더 파싱 시도
+ *      - Upgrade: websocket → RFC6455 핸드셰이크 후 path별 role 부여
+ *      - 그 외 → Content-Length 본문 수신 후 routes.dispatch → 응답 + close
+ *   3. WebSocket 업그레이드된 후엔 wsFrame.decodeFrames로 프레임 처리
+ *      - role='ingest': ESP32 JSON → broadcast + DB INSERT or ringBuffer
+ *      - role='live'  : 대시보드 구독자 (서버→클라이언트 broadcast 수신만)
+ * ───────────────────────────────────────────────────────────────────── */
 
-const HOST = '0.0.0.0';        // WSL2 mirrored 모드에서는 반드시 0.0.0.0에 bind
-const PORT = env.WS_PORT;
-const clients = new Set<Client>();
+import { createServer, type Socket } from 'node:net';
+import { createHash, randomUUID } from 'node:crypto';
+
+import { parseRequest } from './httpParser.js';
+import {
+    sendResponse,
+    errorResponse,
+    type HttpResponse,
+} from './httpResponse.js';
+import { decodeFrames, sendText, sendFrame, Opcode } from './wsFrame.js';
+import { dispatch } from './routes.js';
+import { parseSensorPayload } from './sensorTypes.js';
+import { db } from './dbSession.js';
+import { insertReading } from './dbQueries.js';
+import { pendingFrames } from './ringBuffer.js';
+
+const HOST = process.env.WS_HOST ?? '0.0.0.0';
+const PORT = Number(process.env.WS_PORT ?? 3400);
+
 const RFC6455_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
+type ClientRole = null | 'ingest' | 'live';
 
-/* ── RFC 6455 opcode ────────────────────────────────────────────────
- * 수신 시 opcode = b0 & 0x0F
- * 송신 시 첫 바이트 = 0x80 | opcode  (FIN=1, RSV=000, opcode 4비트)
- * ──────────────────────────────────────────────────────────────── */
-const Opcode = {
-    Text:   0x01,
-    Binary: 0x02,
-    Close:  0x08,
-    Ping:   0x09,
-    Pong:   0x0A,
-} as const;
-type Opcode = typeof Opcode[keyof typeof Opcode];
+/* /live 구독자 모음 — 새 sensor 프레임 도착 시 모두에게 broadcast */
+const liveSubscribers = new Set<Client>();
 
-
-/* ── 도메인 모델: 센서 한 프레임 (모두 uint16, 0~65535) ───────────────
- * INSERT 컬럼 순서와 동일하게 유지해야 함.
- * SensorValues는 12-튜플로 길이를 컴파일러가 보장.
- * ──────────────────────────────────────────────────────────────── */
-const SENSOR_FIELDS = [
-    'pm1_grimm', 'pm25_grimm', 'pm10_grimm',
-    'pm1_tsi',   'pm25_tsi',   'pm10_tsi',
-    'cnt_0p3',   'cnt_0p5',    'cnt_1p0',
-    'cnt_2p5',   'cnt_5p0',    'cnt_10',
-] as const;    // 읽기 전용 프레임 데이터
-
-type SensorField = typeof SENSOR_FIELDS[number];
-type SensorPayload = Record<SensorField, number>;
-type SensorValues = [
-    number, number, number, number, number, number,
-    number, number, number, number, number, number
-];
-
-/* ── 외부 JSON 입력 → SensorPayload 타입 가드 ─────────────────────────
- * 데이터 프레임 유효성 검사
- *   - 정수여야 함 (소수점 이하 버림)
- *   - 0 이상 65535 이하 (16비트 부호 없는 정수 범위)
- * 통과하면 SensorPayload, 실패하면 null.
- * ──────────────────────────────────────────────────────────────── */
-function parseSensorPayload(raw: unknown): SensorPayload | null {
-    if (typeof raw !== 'object' || raw === null) return null;
-    const obj = raw as Record<string, unknown>;
-    const out = {} as SensorPayload;
-    for (const f of SENSOR_FIELDS) {
-        const v = Number(obj[f]);
-        if (!Number.isInteger(v) || v < 0 || v > 65535) {
-            console.warn(`[ws] invalid field ${f}=${String(obj[f])}`);
-            return null;
-        }
-        out[f] = v;
+function liveBroadcast(msg: unknown): void {
+    const text = JSON.stringify(msg);
+    for (const s of liveSubscribers) {
+        try { sendText(s.socket, text); }
+        catch { /* 개별 실패는 무시 */ }
     }
-    return out;
 }
-
-// SensorPayload → SQL 바인딩용 12-튜플 (컬럼 순서대로)
-function toSensorValues(p: SensorPayload): SensorValues {
-    return SENSOR_FIELDS.map((f) => p[f]) as SensorValues;
-}
-
 
 class Client {
     id = randomUUID();
-    buf = Buffer.alloc(0);
-    upgraded = false;
     socket: Socket;
+    buf: Buffer = Buffer.alloc(0);
+    upgraded = false;
+    role: ClientRole = null;
 
     constructor(socket: Socket) {
         this.socket = socket;
-        // 'data' 이벤트의 chunk는 Buffer로 들어옴 (Node 타입 정의상 보장)
         socket.on('data', (chunk: Buffer) => this.onData(chunk));
         socket.on('error', () => this.close());
-        socket.on('end', () => this.close());
+        socket.on('end',   () => this.close());
+        socket.on('close', () => this.close());
     }
 
-    onData(chunk: Buffer) {
+    private onData(chunk: Buffer): void {
         this.buf = Buffer.concat([this.buf, chunk]);
-        if (!this.upgraded) {
-            const idx = this.buf.indexOf('\r\n\r\n');
-            if (idx < 0) return;
-            const headers = this.buf.subarray(0, idx).toString('utf8');
-            this.buf = this.buf.subarray(idx + 4);
-            this.handleHandshake(headers);
+        if (!this.upgraded) this.tryHttp();
+        else                this.drainWs();
+    }
+
+    /* HTTP 헤더 파싱 → WS 업그레이드 or REST 요청 처리 */
+    private tryHttp(): void {
+        const r = parseRequest(this.buf);
+        if (r.kind === 'need-more') return;
+        if (r.kind === 'error') {
+            sendResponse(this.socket, errorResponse(r.status, r.reason));
             return;
         }
-        this.drainFrames();
+        const req = r.req;
+
+        const isUpgrade = (req.headers['upgrade'] ?? '').toLowerCase() === 'websocket';
+        if (isUpgrade) {
+            // 헤더만 소비. WebSocket 프레임은 그 다음 바이트부터.
+            this.buf = this.buf.subarray(req.headerByteLen);
+            this.handleWsHandshake(req.path, req.headers);
+            return;
+        }
+
+        // 일반 REST 요청: Content-Length만큼 더 수신해야 함
+        if (this.buf.length < req.headerByteLen + req.contentLength) return;
+
+        const body = this.buf.subarray(req.headerByteLen, req.headerByteLen + req.contentLength);
+        const reqOrigin = req.headers['origin'];
+        // remoteAddress는 IPv6-mapped form일 수 있음. subnet.ts에서 정규화.
+        const clientIp = this.socket.remoteAddress ?? '';
+
+        dispatch({ req, body: Buffer.from(body), clientIp })
+            .then((res: HttpResponse) => sendResponse(this.socket, res, reqOrigin))
+            .catch((e: unknown) => {
+                const msg = e instanceof Error ? e.message : String(e);
+                sendResponse(this.socket, errorResponse(500, msg), reqOrigin);
+            });
     }
 
-    /* ── HTTP/1.1 Upgrade — RFC 6455 §1.3 핸드셰이크 ─────────────────────
-   *   accept = base64( SHA1( client_key + GUID ) )
-   *   GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-   * ──────────────────────────────────────────────────────────────── */
-    private handleHandshake(raw: string) {
-        console.log(`[ws] client ${this.id} handshake:\n${raw}`);
-        const m = raw.match(/Sec-WebSocket-Key:\s*(.+)/i);
-        if (!m) { this.close(); return; }
-        const key = m[1].trim();
+    private handleWsHandshake(path: string, headers: Record<string, string>): void {
+        const key = headers['sec-websocket-key'];
+        if (!key) {
+            sendResponse(this.socket, errorResponse(400, 'Missing Sec-WebSocket-Key'));
+            return;
+        }
+        if (path !== '/ingest' && path !== '/live') {
+            sendResponse(this.socket, errorResponse(404, `Unknown WS path: ${path}`));
+            return;
+        }
+
         const accept = createHash('sha1').update(key + RFC6455_GUID).digest('base64');
         const resp =
             'HTTP/1.1 101 Switching Protocols\r\n' +
@@ -111,135 +120,83 @@ class Client {
             `Sec-WebSocket-Accept: ${accept}\r\n\r\n`;
         this.socket.write(resp);
         this.upgraded = true;
-        console.log(`[ws] client ${this.id} upgraded`);
+        this.role = path === '/ingest' ? 'ingest' : 'live';
+
+        if (this.role === 'live') liveSubscribers.add(this);
+        console.log(`[ws] client ${this.id} upgraded as ${this.role} (${this.socket.remoteAddress})`);
+
+        // 핸드셰이크 직후에 이미 도착해 있는 프레임이 있을 수 있음
+        if (this.buf.length > 0) this.drainWs();
     }
 
-    /* ── 프레임 unmask + 페이로드 추출 ──────────────────────────────────
-     * 한 TCP 청크에 여러 WebSocket 프레임이 섞여 들어올 수 있으므로 루프.
-     * ──────────────────────────────────────────────────────────────── */
-    private drainFrames() {
-        for (; ;) {
-            if (this.buf.length < 2) return;
-            const b0 = this.buf[0];
-            const b1 = this.buf[1];
-            const op = (b0 & 0x0F) as Opcode;     // 하위 4비트만 opcode
-            const masked = (b1 & 0x80) !== 0;
-            let plen = b1 & 0x7F;
-            let off = 2;
-            if (plen === 126) {
-                if (this.buf.length < 4) return;
-                plen = this.buf.readUInt16BE(2);
-                off = 4;
-            } else if (plen === 127) {
-                if (this.buf.length < 10) return;
-                /* 64비트 길이지만 우리 페이로드는 항상 256B 이내 (안전 변환) */
-                plen = Number(this.buf.readBigUInt64BE(2));
-                off = 10;
-            }
-            let mask: Buffer | null = null;
-            if (masked) {
-                if (this.buf.length < off + 4) return;
-                mask = this.buf.subarray(off, off + 4);
-                off += 4;
-            }
-            if (this.buf.length < off + plen) return;
+    /* WebSocket 프레임 처리 */
+    private drainWs(): void {
+        const { frames, remainder } = decodeFrames(this.buf);
+        this.buf = remainder;
 
-            const payload = Buffer.alloc(plen);
-            for (let i = 0; i < plen; i++) {
-                payload[i] = mask ? this.buf[off + i] ^ mask[i & 3] : this.buf[off + i];
-            }
-            this.buf = this.buf.subarray(off + plen);
-
-            /* 프레임 처리 — opcode별 분기 */
-            switch (op) {
+        for (const f of frames) {
+            switch (f.opcode) {
                 case Opcode.Text:
-                    this.handleTextPayload(payload.toString('utf8'));
+                    if (this.role === 'ingest') this.handleIngestText(f.payload.toString('utf8'));
+                    // /live 구독자가 보내는 메시지는 무시 (단방향)
+                    break;
+                case Opcode.Ping:
+                    sendFrame(this.socket, Opcode.Pong, f.payload);
                     break;
                 case Opcode.Close:
                     this.close();
-                    break;
-                case Opcode.Ping:
-                    this.sendFrame(0x80 | Opcode.Pong, payload);   // ping → pong
+                    return;
+                default:
+                    // Binary 등 미사용
                     break;
             }
         }
     }
 
-    /* ── text 프레임 처리: JSON → 타입 검증 → DB INSERT ───────── */
-    private handleTextPayload(text: string) {
+    /* ESP32 ingress: JSON → broadcast → DB INSERT or ringBuffer */
+    private handleIngestText(text: string): void {
         let parsed: unknown;
         try { parsed = JSON.parse(text); }
         catch {
-            console.warn('[ws] JSON parse fail:', text);
+            console.warn('[ingest] JSON parse fail');
             return;
         }
-
-        // 타입 가드 통과 시 SensorPayload 보장
         const payload = parseSensorPayload(parsed);
-        if (payload === null) return;
+        if (!payload) return;
+        const ts = new Date();
 
-        // typescript의 DB insert 기능 — await 안 함 (TCP 수신 블로킹 방지)
-        this.insertSensor(toSensorValues(payload)).catch(console.error);
-    }
+        // 1) 즉시 broadcast (대시보드는 DB 상태와 무관하게 실시간 데이터 수신)
+        liveBroadcast({
+            type: 'sensor',
+            data: { ...payload, recorded_at: ts.toISOString() },
+        });
 
-
-    /* DB Query Function */
-    // schema에서 데이터 타입이 모두 정수(uint16)이므로 12-튜플 number로 바인딩
-    private async insertSensor(values: SensorValues) {
-        try {
-            // await using: 스코프 종료 시 자동으로 conn.release() 호출 (TC39 explicit resource management)
-            await using conn = await pool.getConnection();
-            const sql = `
-        INSERT INTO pm_sensor_data
-            (recorded_at,
-             pm1_grimm, pm25_grimm, pm10_grimm,
-             pm1_tsi,   pm25_tsi,   pm10_tsi,
-             cnt_0p3,   cnt_0p5,    cnt_1p0,
-             cnt_2p5,   cnt_5p0,    cnt_10)
-        VALUES (NOW(), ?,?,?,?,?,?,?,?,?,?,?,?)
-        `;
-            await conn.execute(sql, values);
-            console.log(`[db] inserted - pm2.5=${values[1]} ug/m³`);
-        } catch (e: unknown) {
-            // catch는 unknown으로 받고 알려진 형태(ErrnoException)로 좁혀서 사용
-            const err = e as NodeJS.ErrnoException;
-            console.warn(`[db] insert failed: ${err.code ?? err.message ?? String(e)}`);
-        }
-    }
-
-    /* ── 프레임 송신 — RFC 6455 에 따라 서버 측은 마스킹 안 함 ─────────── */
-    private sendFrame(opcode: number, payload: Buffer) {
-        if (this.socket.destroyed) return;
-        const len = payload.length;
-        let header: Buffer;
-        if (len < 126) {
-            header = Buffer.from([opcode, len]);
-        } else if (len < 65536) {
-            header = Buffer.alloc(4);
-            header[0] = opcode; header[1] = 126;
-            header.writeUInt16BE(len, 2);
+        // 2) DB 연결되어 있으면 INSERT, 아니면 ringBuffer
+        //    await 하지 않음 — TCP 수신 블로킹 방지 (저지연 유지)
+        if (db.isReady()) {
+            insertReading(payload, ts).catch(e => {
+                console.warn('[ingest] insert failed:', e instanceof Error ? e.message : e);
+                pendingFrames.push({ ts, payload });   // 실패한 프레임도 다음 재연결 때 재시도
+            });
         } else {
-            header = Buffer.alloc(10);
-            header[0] = opcode; header[1] = 127;
-            header.writeBigUInt64BE(BigInt(len), 2);
+            pendingFrames.push({ ts, payload });
         }
-        this.socket.write(Buffer.concat([header, payload]));
     }
 
-    close() {
-        if (this.socket.destroyed) return;
-        this.socket.destroy();
-        clients.delete(this);
-        console.log(`[ws] client ${this.id} closed`);
+    close(): void {
+        if (this.role === 'live') liveSubscribers.delete(this);
+        if (!this.socket.destroyed) this.socket.destroy();
     }
 }
 
-/* ── TCP 서버 ─────────────────────────────────── */
+/* ── TCP 서버 부팅 ─────────────────────────────────────────── */
 const server = createServer((sock) => {
-    console.log(`[ws] connection from ${sock.remoteAddress}:${sock.remotePort}`);
-    const c = new Client(sock);
-    clients.add(c);
+    new Client(sock);
 });
+
 server.listen(PORT, HOST, () => {
-    console.log(`server running on ws://${HOST}:${PORT}`);
+    console.log(`server listening on ${HOST}:${PORT}`);
+    console.log(`  HTTP REST   → /api/db/{connect,status,disconnect}, /api/sensor/{latest,history}, /healthz`);
+    console.log(`  WebSocket   → /ingest (ESP32), /live (dashboard)`);
+    console.log(`  DB session  → not connected (will be provisioned by first dashboard)`);
 });

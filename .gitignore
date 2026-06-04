@@ -6,3 +6,13 @@
 .env
 .sql
 /include/config_local.h
+
+# Node 의존성 / 빌드 결과 (라이브러리는 트래킹하지 않음)
+node_modules/
+web/dist/
+
+# 서버 빌드 산출물 / 레거시 (server/*.ts 소스만 트래킹)
+# server.js: server.ts의 tsc 인플레이스 컴파일 결과
+# config/: 608881f 리팩터링에서 제거된 env.ts의 잔존물
+server/server.js
+server/config/

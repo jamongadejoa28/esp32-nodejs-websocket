@@ -24,5 +24,9 @@ CREATE TABLE IF NOT EXISTS pm_sensor_data (
     cnt_5p0      INT UNSIGNED NOT NULL DEFAULT 0,   -- particles >5.0 μm
     cnt_10       INT UNSIGNED NOT NULL DEFAULT 0,   -- particles >10 μm
 
+    -- US633-F1K-T4 차압센서 (2026-05-25 추가, NULL 허용으로 기존 펌웨어 호환)
+    pressure_pa     SMALLINT          NULL DEFAULT NULL,  -- signed Pa (±1000)
+    pressure_status TINYINT UNSIGNED  NULL DEFAULT NULL,  -- US633 status 바이트
+
     INDEX idx_recorded_at (recorded_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8;
