@@ -28,7 +28,21 @@ function isIpv4Literal(s: string): boolean {
     return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(s);
 }
 
+// 같은 머신(loopback)에서 들어온 요청은 서브넷 검사를 우회.
+// Vite dev proxy(브라우저 → :5173 → :3400) 시에도 clientIp가 127.0.0.1로 잡혀
+// LAN상의 DB에 붙으려면 어차피 한 번은 우회가 필요. 운영 환경에선 단일 origin
+// 정적 서빙으로 전환되면 자연히 실제 LAN IP로 잡히므로 이 우회는 트리거 안 됨.
+function isLoopback(ip: string): boolean {
+    if (ip === '::1') return true;
+    const v4 = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+    return v4.startsWith('127.');
+}
+
 export async function isSameSubnet24(clientIp: string, dbHost: string): Promise<SubnetCheck> {
+    if (isLoopback(clientIp)) {
+        return { ok: true, clientIp, dbIp: dbHost };
+    }
+
     const cPrefix = prefix24(clientIp);
     if (!cPrefix) {
         return { ok: false, reason: `client IP "${clientIp}" is not IPv4`, clientIp };
