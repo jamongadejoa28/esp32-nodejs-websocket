@@ -16,3 +16,4 @@ web/dist/
 # config/: 608881f 리팩터링에서 제거된 env.ts의 잔존물
 server/server.js
 server/config/
+.antigravitycli*
